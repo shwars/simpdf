@@ -9,6 +9,7 @@ The library is centered on a `MarkdownPdfRenderer` class. You give it a director
 - Uses `fpdf2` as the PDF backend
 - Supports external TTF fonts and Cyrillic-friendly fonts such as DejaVu Sans
 - Provides a helper to download DejaVu Sans fonts into a target directory
+- Supports markdown images from filesystem paths, `data:` URLs, remote URLs, and custom callbacks
 - Class-first API with optional convenience helpers
 - Minimal CLI for rendering Markdown and downloading DejaVu fonts
 - Supports these Markdown elements in v1:
@@ -22,6 +23,7 @@ The library is centered on a `MarkdownPdfRenderer` class. You give it a director
   - fenced code blocks
   - thematic breaks
   - clickable links
+  - block images
 
 ## Installation
 
@@ -71,10 +73,7 @@ downloaded = download_dejavu_fonts("fonts")
 print([path.name for path in downloaded])
 ```
 
-The helper downloads the DejaVu font files from this public GitHub repository layout:
-
-- `https://github.com/shwars/simpdf/raw/refs/heads/main/fonts/DejaVuSans.ttf`
-- other font files use the same URL pattern
+The helper downloads the DejaVu font files from public GitHub repository.
 
 ## Using Custom Fonts
 
@@ -131,8 +130,69 @@ Supported option groups:
 - `table`: font sizes, padding, minimum column width, spacing
 - `code_block`: font size, padding, colors, spacing
 - `inline_code`: inline code text color
+- `images`: block image sizing, spacing, alignment, table-cell best-effort height
 - `links`: link color and underline toggle
 - `thematic_break`: rule color, width, spacing
+
+## Image Support
+
+Markdown images use the normal syntax:
+
+```markdown
+![alt text](path-or-url)
+```
+
+Supported image sources in `0.1.1`:
+
+- custom callback
+- filesystem paths
+- `data:` URLs with embedded image data
+- remote `http/https` URLs
+
+### Filesystem Images
+
+If you do nothing, filesystem images are resolved relative to the current working directory. If you want a different base directory, pass `image_base_dir`.
+
+```python
+from simpdf import FontFace, MarkdownPdfRenderer
+
+renderer = MarkdownPdfRenderer(
+    font_directory="fonts",
+    font_face=FontFace.dejavu_sans(),
+    image_base_dir="docs-assets",
+)
+
+markdown_text = "![Logo](logo.png)"
+pdf_bytes = renderer.render_to_bytes(markdown_text)
+```
+
+### Custom Callback
+
+The callback receives `(alt_text, source)` and may return raw bytes, a binary stream, or a `PIL.Image.Image` when Pillow is installed. Returning `None` falls through to the built-in resolvers.
+
+```python
+from io import BytesIO
+from simpdf import FontFace, MarkdownPdfRenderer
+
+def image_callback(alt_text: str, source: str):
+    if source == "custom://badge":
+        return BytesIO(open("badge.png", "rb").read())
+    return None
+
+renderer = MarkdownPdfRenderer(
+    font_directory="fonts",
+    font_face=FontFace.dejavu_sans(),
+    image_resolver=image_callback,
+)
+```
+
+### Layout Behavior
+
+- Images render as standalone block elements.
+- If a paragraph mixes text and images, the renderer outputs the text and image blocks in order.
+- Images inside table cells are best-effort in `0.1.1`.
+  - image-only cells are rendered as images
+  - mixed text+image cells fall back to text rendering using the image alt text
 
 ## Convenience Helpers
 
@@ -154,7 +214,8 @@ simpdf render input.md output.pdf \
   --font-regular DejaVuSans.ttf \
   --font-bold DejaVuSans-Bold.ttf \
   --font-italic DejaVuSans-Oblique.ttf \
-  --font-bold-italic DejaVuSans-BoldOblique.ttf
+  --font-bold-italic DejaVuSans-BoldOblique.ttf \
+  --image-base-dir ./images
 ```
 
 Download DejaVu fonts:
@@ -167,7 +228,7 @@ If you want custom formatting from the CLI, pass a JSON file with `--options-fil
 
 ## Examples
 
-See [`examples/basic_render.py`](/D:/GIT/simpdf/examples/basic_render.py), [`examples/custom_font_and_style.py`](/D:/GIT/simpdf/examples/custom_font_and_style.py), and [`examples/rich_markdown.py`](/D:/GIT/simpdf/examples/rich_markdown.py).
+See [`examples/basic_render.py`](/D:/GIT/simpdf/examples/basic_render.py), [`examples/custom_font_and_style.py`](/D:/GIT/simpdf/examples/custom_font_and_style.py), [`examples/rich_markdown.py`](/D:/GIT/simpdf/examples/rich_markdown.py), [`examples/images_from_filesystem.py`](/D:/GIT/simpdf/examples/images_from_filesystem.py), and [`examples/images_custom_callback.py`](/D:/GIT/simpdf/examples/images_custom_callback.py).
 
 ## Tests
 
@@ -176,6 +237,7 @@ The repo now contains a pytest suite that covers:
 - font config validation
 - DejaVu download helper behavior
 - markdown token flattening and table extraction
+- image resolvers and image rendering
 - PDF rendering with Cyrillic content
 - formatting overrides
 - CLI render and download flows

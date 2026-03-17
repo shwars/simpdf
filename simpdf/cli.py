@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--font-bold")
     render_parser.add_argument("--font-italic")
     render_parser.add_argument("--font-bold-italic")
+    render_parser.add_argument("--image-base-dir", type=Path, help="Base directory for resolving markdown image paths.")
     render_parser.add_argument("--options-file", type=Path, help="Path to a JSON file with formatting options.")
 
     download_parser = subparsers.add_parser("download-dejavu", help="Download the DejaVu Sans font files.")
@@ -52,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
             bold_italic=args.font_bold_italic,
         ),
         formatting_options=options,
+        image_base_dir=args.image_base_dir,
     )
     markdown_text = args.input_markdown.read_text(encoding="utf-8")
     renderer.render_to_file(markdown_text, args.output_pdf)

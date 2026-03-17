@@ -81,6 +81,14 @@ DEFAULT_FORMATTING_OPTIONS = {
     "inline_code": {
         "text_color": (120, 50, 20),
     },
+    "images": {
+        "max_width": 160.0,
+        "max_height": 120.0,
+        "spacing_before": 2.0,
+        "spacing_after": 3.0,
+        "align": "center",
+        "table_cell_max_height": 24.0,
+    },
     "links": {
         "color": (0, 102, 204),
         "underline": True,

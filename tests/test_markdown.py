@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from simpdf.markdown import inline_fragments_from_node, parse_markdown_tree, plain_text_from_node, table_rows_from_node
+from simpdf.markdown import inline_fragments_from_node, paragraph_elements_from_node, parse_markdown_tree, plain_text_from_node, table_rows_from_node
 
 
 def test_inline_fragments_capture_bold_italic_code_and_links():
@@ -25,5 +25,16 @@ def test_table_rows_from_node_extracts_header_and_body():
     table = tree.children[0]
     header, rows = table_rows_from_node(table)
 
-    assert header == ["Name", "Value"]
-    assert rows == [["One", "1"], ["Two", "2"]]
+    assert [cell.text for cell in header] == ["Name", "Value"]
+    assert [[cell.text for cell in row] for row in rows] == [["One", "1"], ["Two", "2"]]
+
+
+def test_paragraph_elements_split_images_from_text():
+    tree = parse_markdown_tree("Before ![alt](image.png) after")
+    paragraph = tree.children[0]
+    elements = paragraph_elements_from_node(paragraph.children[0])
+
+    assert len(elements) == 3
+    assert "".join(fragment.text for fragment in elements[0].fragments) == "Before "
+    assert elements[1].image.source == "image.png"
+    assert "".join(fragment.text for fragment in elements[2].fragments) == " after"

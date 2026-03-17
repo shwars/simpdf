@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 import re
 from typing import Mapping
@@ -8,7 +9,8 @@ from typing import Mapping
 from fpdf import FPDF
 
 from .fonts import FontFace, coerce_font_face, register_font_family
-from .markdown import InlineFragment, create_markdown_parser, inline_fragments_from_node, parse_markdown_tree, table_rows_from_node
+from .images import FileImageResolver, build_default_image_resolver, resolve_markdown_image
+from .markdown import InlineFragment, TableCellContent, create_markdown_parser, inline_fragments_from_node, paragraph_elements_from_node, parse_markdown_tree, table_rows_from_node
 from .options import merge_formatting_options
 
 
@@ -18,11 +20,20 @@ class MarkdownPdfRenderer:
         font_directory: str | Path,
         font_face: FontFace | Mapping[str, str],
         formatting_options: dict | None = None,
+        image_resolver=None,
+        image_base_dir: str | Path | None = None,
     ) -> None:
         self.font_directory = Path(font_directory)
         self.font_face = coerce_font_face(font_face)
         self.options = merge_formatting_options(formatting_options)
         self.parser = create_markdown_parser()
+        self.image_base_dir = Path(image_base_dir) if image_base_dir is not None else None
+        self.file_image_resolver = FileImageResolver(base_dir=self.image_base_dir)
+        self.image_resolver = build_default_image_resolver(
+            user_resolver=image_resolver,
+            base_dir=self.image_base_dir,
+        )
+        self._image_cache: dict[str, object] = {}
 
     def render_to_bytes(self, markdown_text: str) -> bytes:
         pdf = self._create_pdf()
@@ -98,16 +109,28 @@ class MarkdownPdfRenderer:
         pdf.ln(heading_options["spacing_after"].get(level, 2.0))
 
     def _render_paragraph(self, pdf: FPDF, node, font_family: str) -> None:
-        fragments = self._inline_fragments_for_first_child(node)
-        if fragments:
-            self._write_fragments(
-                pdf,
-                fragments,
-                font_family=font_family,
-                font_size=self.options["text"]["font_size"],
-                line_height_multiplier=self.options["text"]["line_height"],
-            )
-        pdf.ln(self.options["paragraph"]["spacing_after"])
+        if not node.children:
+            pdf.ln(self.options["paragraph"]["spacing_after"])
+            return
+
+        rendered_any = False
+        elements = paragraph_elements_from_node(node.children[0])
+        for element in elements:
+            if element.is_image:
+                self._render_block_image(pdf, element.image)
+                rendered_any = True
+                continue
+            if element.fragments:
+                self._write_fragments(
+                    pdf,
+                    list(element.fragments),
+                    font_family=font_family,
+                    font_size=self.options["text"]["font_size"],
+                    line_height_multiplier=self.options["text"]["line_height"],
+                )
+                rendered_any = True
+        if rendered_any and elements and not elements[-1].is_image:
+            pdf.ln(self.options["paragraph"]["spacing_after"])
 
     def _render_list(self, pdf: FPDF, node, font_family: str, *, list_depth: int) -> None:
         list_options = self.options["lists"]
@@ -217,8 +240,8 @@ class MarkdownPdfRenderer:
 
         table_options = self.options["table"]
         col_count = max([len(header)] + [len(row) for row in body] + [1])
-        normalized_header = header + [""] * (col_count - len(header))
-        normalized_body = [row + [""] * (col_count - len(row)) for row in body]
+        normalized_header = header + [self._empty_table_cell()] * (col_count - len(header))
+        normalized_body = [row + [self._empty_table_cell()] * (col_count - len(row)) for row in body]
         usable_width = pdf.w - pdf.l_margin - pdf.r_margin
 
         pdf.set_font(font_family, "", table_options["font_size"])
@@ -236,7 +259,7 @@ class MarkdownPdfRenderer:
         pdf.ln(table_options["spacing_after"])
         pdf.set_x(pdf.l_margin)
 
-    def _draw_table_header(self, pdf: FPDF, font_family: str, header: list[str], widths: list[float]) -> None:
+    def _draw_table_header(self, pdf: FPDF, font_family: str, header: list, widths: list[float]) -> None:
         table_options = self.options["table"]
         pdf.set_font(font_family, "B", table_options["heading_font_size"])
         expected_height = self._estimate_row_height(pdf, header, widths)
@@ -244,45 +267,59 @@ class MarkdownPdfRenderer:
             pdf.add_page()
         self._draw_table_row(pdf, header, widths)
 
-    def _draw_table_row(self, pdf: FPDF, row: list[str], widths: list[float]) -> float:
+    def _draw_table_row(self, pdf: FPDF, row: list, widths: list[float]) -> float:
         table_options = self.options["table"]
         line_height = table_options["line_height"]
         cell_padding = table_options["cell_padding"]
         x0 = pdf.l_margin
         y0 = pdf.get_y()
 
-        wrapped_per_cell = []
-        max_lines = 1
+        prepared_cells = []
+        max_height = line_height + (2 * cell_padding)
         for index, width in enumerate(widths):
-            text = row[index] if index < len(row) else ""
-            wrapped = self._wrap_cell_text(pdf, text, max(1.0, width - (2 * cell_padding)))
-            wrapped_per_cell.append(wrapped)
-            max_lines = max(max_lines, len(wrapped))
+            cell = row[index] if index < len(row) else self._empty_table_cell()
+            prepared = self._prepare_table_cell(pdf, cell, max(1.0, width - (2 * cell_padding)))
+            prepared_cells.append(prepared)
+            max_height = max(max_height, prepared["height"])
 
-        row_height = max_lines * line_height + (2 * cell_padding)
+        row_height = max_height
         x = x0
         for index, width in enumerate(widths):
             pdf.rect(x, y0, width, row_height)
+            prepared = prepared_cells[index]
             pdf.set_xy(x + cell_padding, y0 + cell_padding)
-            pdf.multi_cell(max(1.0, width - (2 * cell_padding)), line_height, "\n".join(wrapped_per_cell[index]))
+            if prepared["kind"] == "image":
+                image_y = y0 + ((row_height - prepared["height"]) / 2.0) + cell_padding
+                pdf.image(
+                    prepared["stream"],
+                    x=x + cell_padding,
+                    y=image_y,
+                    w=prepared["width"],
+                    h=prepared["image_height"],
+                    keep_aspect_ratio=True,
+                    alt_text=prepared["image"].alt_text,
+                    link=prepared["image"].link or "",
+                )
+            else:
+                pdf.multi_cell(max(1.0, width - (2 * cell_padding)), line_height, "\n".join(prepared["lines"]))
             x += width
             pdf.set_xy(x, y0)
 
         pdf.set_xy(x0, y0 + row_height)
         return row_height
 
-    def _estimate_row_height(self, pdf: FPDF, row: list[str], widths: list[float]) -> float:
+    def _estimate_row_height(self, pdf: FPDF, row: list, widths: list[float]) -> float:
         table_options = self.options["table"]
         cell_padding = table_options["cell_padding"]
         line_height = table_options["line_height"]
-        max_lines = 1
+        max_height = line_height + (2 * cell_padding)
         for index, width in enumerate(widths):
-            text = row[index] if index < len(row) else ""
-            lines = self._wrap_cell_text(pdf, text, max(1.0, width - (2 * cell_padding)))
-            max_lines = max(max_lines, len(lines))
-        return max_lines * line_height + (2 * cell_padding)
+            cell = row[index] if index < len(row) else self._empty_table_cell()
+            prepared = self._prepare_table_cell(pdf, cell, max(1.0, width - (2 * cell_padding)))
+            max_height = max(max_height, prepared["height"])
+        return max_height
 
-    def _compute_table_col_widths(self, pdf: FPDF, rows: list[list[str]], usable_width: float, min_col_width: float) -> list[float]:
+    def _compute_table_col_widths(self, pdf: FPDF, rows: list[list], usable_width: float, min_col_width: float) -> list[float]:
         col_count = max((len(row) for row in rows), default=1)
         weights = [self._column_score(pdf, rows, index) for index in range(col_count)]
         total_weight = sum(weights) or 1.0
@@ -306,17 +343,115 @@ class MarkdownPdfRenderer:
             widths = [width * scale for width in widths]
         return widths
 
-    def _column_score(self, pdf: FPDF, rows: list[list[str]], col_index: int) -> float:
+    def _column_score(self, pdf: FPDF, rows: list[list], col_index: int) -> float:
         max_cell_width = 0.0
         max_token_width = 0.0
         for row in rows:
-            value = self._normalize_for_pdf(row[col_index] if col_index < len(row) else "")
-            if not value:
+            cell = row[col_index] if col_index < len(row) else self._empty_table_cell()
+            value = self._normalize_for_pdf(cell.text)
+            if not value and cell.image is None:
                 continue
             max_cell_width = max(max_cell_width, pdf.get_string_width(value))
             for token in value.split():
                 max_token_width = max(max_token_width, pdf.get_string_width(token))
+            if cell.image is not None and not cell.has_mixed_content:
+                resolved = self._resolve_image(cell.image)
+                max_cell_width = max(max_cell_width, self._default_image_width_mm(resolved))
         return max(1.0, (max_cell_width * 0.25) + (max_token_width * 0.75))
+
+    def _empty_table_cell(self) -> TableCellContent:
+        return TableCellContent(text="")
+
+    def _prepare_table_cell(self, pdf: FPDF, cell: TableCellContent, max_width: float) -> dict:
+        table_options = self.options["table"]
+        cell_padding = table_options["cell_padding"]
+        if cell.image is not None and not cell.has_mixed_content:
+            resolved = self._resolve_image(cell.image)
+            image_width, image_height = self._fit_image(
+                resolved,
+                max_width=max_width,
+                max_height=self.options["images"]["table_cell_max_height"],
+            )
+            return {
+                "kind": "image",
+                "image": resolved,
+                "stream": self._image_stream(resolved),
+                "width": image_width,
+                "image_height": image_height,
+                "height": image_height + (2 * cell_padding),
+            }
+
+        lines = self._wrap_cell_text(pdf, cell.text, max_width)
+        return {
+            "kind": "text",
+            "lines": lines,
+            "height": (len(lines) * table_options["line_height"]) + (2 * cell_padding),
+        }
+
+    def _render_block_image(self, pdf: FPDF, markdown_image) -> None:
+        image_options = self.options["images"]
+        resolved = self._resolve_image(markdown_image)
+        width, height = self._fit_image(
+            resolved,
+            max_width=image_options["max_width"],
+            max_height=image_options["max_height"],
+        )
+        total_height = height + image_options["spacing_before"] + image_options["spacing_after"]
+        if pdf.get_y() + total_height > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
+        pdf.ln(image_options["spacing_before"])
+        x = pdf.l_margin
+        if image_options["align"] == "center":
+            x = pdf.l_margin + ((pdf.w - pdf.l_margin - pdf.r_margin - width) / 2.0)
+        pdf.image(
+            self._image_stream(resolved),
+            x=x,
+            y=pdf.get_y(),
+            w=width,
+            h=height,
+            keep_aspect_ratio=True,
+            alt_text=resolved.alt_text,
+            link=resolved.link or "",
+        )
+        pdf.set_y(pdf.get_y() + height)
+        pdf.ln(image_options["spacing_after"])
+
+    def _resolve_image(self, markdown_image):
+        cached = self._image_cache.get(markdown_image.source)
+        if cached is not None:
+            return cached.__class__(
+                alt_text=markdown_image.alt_text,
+                source=cached.source,
+                data=cached.data,
+                width_px=cached.width_px,
+                height_px=cached.height_px,
+                link=cached.link,
+            )
+        resolved = resolve_markdown_image(
+            self.image_resolver,
+            alt_text=markdown_image.alt_text,
+            source=markdown_image.source,
+        )
+        self._image_cache[markdown_image.source] = resolved
+        return resolved
+
+    def _fit_image(self, resolved_image, *, max_width: float, max_height: float) -> tuple[float, float]:
+        base_width = self._default_image_width_mm(resolved_image)
+        base_height = self._default_image_height_mm(resolved_image)
+        width_scale = max_width / base_width if base_width else 1.0
+        height_scale = max_height / base_height if base_height else 1.0
+        scale = min(1.0, width_scale, height_scale)
+        return max(1.0, base_width * scale), max(1.0, base_height * scale)
+
+    def _default_image_width_mm(self, resolved_image) -> float:
+        return resolved_image.width_px * 25.4 / 72.0
+
+    def _default_image_height_mm(self, resolved_image) -> float:
+        return resolved_image.height_px * 25.4 / 72.0
+
+    def _image_stream(self, resolved_image) -> BytesIO:
+        return BytesIO(resolved_image.data)
 
     def _wrap_cell_text(self, pdf: FPDF, text: str, max_width: float) -> list[str]:
         value = self._normalize_for_pdf(text)
@@ -628,11 +763,15 @@ def render_markdown_to_pdf_bytes(
     font_directory: str | Path,
     font_face: FontFace | Mapping[str, str],
     formatting_options: dict | None = None,
+    image_resolver=None,
+    image_base_dir: str | Path | None = None,
 ) -> bytes:
     renderer = MarkdownPdfRenderer(
         font_directory=font_directory,
         font_face=font_face,
         formatting_options=formatting_options,
+        image_resolver=image_resolver,
+        image_base_dir=image_base_dir,
     )
     return renderer.render_to_bytes(markdown_text)
 
@@ -644,10 +783,14 @@ def render_markdown_to_pdf_file(
     font_directory: str | Path,
     font_face: FontFace | Mapping[str, str],
     formatting_options: dict | None = None,
+    image_resolver=None,
+    image_base_dir: str | Path | None = None,
 ) -> Path:
     renderer = MarkdownPdfRenderer(
         font_directory=font_directory,
         font_face=font_face,
         formatting_options=formatting_options,
+        image_resolver=image_resolver,
+        image_base_dir=image_base_dir,
     )
     return renderer.render_to_file(markdown_text, output_path)

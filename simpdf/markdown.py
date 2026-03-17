@@ -15,6 +15,29 @@ class InlineFragment:
     link: str | None = None
 
 
+@dataclass(frozen=True)
+class MarkdownImage:
+    alt_text: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ParagraphElement:
+    fragments: tuple[InlineFragment, ...] = ()
+    image: MarkdownImage | None = None
+
+    @property
+    def is_image(self) -> bool:
+        return self.image is not None
+
+
+@dataclass(frozen=True)
+class TableCellContent:
+    text: str
+    image: MarkdownImage | None = None
+    has_mixed_content: bool = False
+
+
 def create_markdown_parser() -> MarkdownIt:
     return MarkdownIt("commonmark", {"html": False, "linkify": True}).enable("table").enable("strikethrough")
 
@@ -32,24 +55,67 @@ def plain_text_from_node(node: SyntaxTreeNode) -> str:
     return "".join(fragment.text for fragment in inline_fragments_from_node(node))
 
 
-def table_rows_from_node(table_node: SyntaxTreeNode) -> tuple[list[str], list[list[str]]]:
-    header: list[str] = []
-    rows: list[list[str]] = []
+def paragraph_elements_from_node(node: SyntaxTreeNode) -> list[ParagraphElement]:
+    if not node.children:
+        return []
+
+    elements: list[ParagraphElement] = []
+    current_fragments: list[InlineFragment] = []
+
+    for child in node.children:
+        if child.type == "image":
+            if current_fragments:
+                elements.append(ParagraphElement(fragments=tuple(current_fragments)))
+                current_fragments = []
+            elements.append(ParagraphElement(image=_image_from_node(child)))
+            continue
+        current_fragments.extend(
+            _collect_inline_fragments(child, bold=False, italic=False, code=False, link=None)
+        )
+
+    if current_fragments:
+        elements.append(ParagraphElement(fragments=tuple(current_fragments)))
+    return elements
+
+
+def table_rows_from_node(table_node: SyntaxTreeNode) -> tuple[list[TableCellContent], list[list[TableCellContent]]]:
+    header: list[TableCellContent] = []
+    rows: list[list[TableCellContent]] = []
 
     for child in table_node.children or []:
         if child.type == "thead":
-            header = [_cell_text(cell) for row in child.children or [] for cell in row.children or []]
+            header = [_cell_content(cell) for row in child.children or [] for cell in row.children or []]
         elif child.type == "tbody":
             for row in child.children or []:
-                rows.append([_cell_text(cell) for cell in row.children or []])
+                rows.append([_cell_content(cell) for cell in row.children or []])
 
     return header, rows
 
 
-def _cell_text(cell_node: SyntaxTreeNode) -> str:
+def _cell_content(cell_node: SyntaxTreeNode) -> TableCellContent:
     if not cell_node.children:
-        return ""
-    return plain_text_from_node(cell_node.children[0]).strip()
+        return TableCellContent(text="")
+
+    elements = paragraph_elements_from_node(cell_node.children[0])
+    image_parts = [element.image for element in elements if element.image is not None]
+    text_parts = [fragment.text for element in elements for fragment in element.fragments]
+    alt_text_parts = [image.alt_text for image in image_parts if image and image.alt_text]
+    normalized_text = "".join(text_parts + alt_text_parts).strip()
+
+    if len(elements) == 1 and image_parts and not text_parts:
+        return TableCellContent(text=image_parts[0].alt_text, image=image_parts[0], has_mixed_content=False)
+
+    return TableCellContent(
+        text=normalized_text,
+        image=image_parts[0] if image_parts else None,
+        has_mixed_content=bool(image_parts) and bool(text_parts or len(image_parts) > 1),
+    )
+
+
+def _image_from_node(node: SyntaxTreeNode) -> MarkdownImage:
+    source = node.attrs.get("src", "")
+    alt_text = node.content or "".join(child.content for child in node.children or [] if child.type == "text")
+    return MarkdownImage(alt_text=alt_text, source=source)
 
 
 def _collect_inline_fragments(
